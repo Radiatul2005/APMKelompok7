@@ -1,17 +1,29 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import re
-import spacy
 import plotly.express as px
 import plotly.graph_objects as go
-from difflib import SequenceMatcher
-from Sastrawi.StopWordRemover.StopWordRemoverFactory import StopWordRemoverFactory
-from Sastrawi.Stemmer.StemmerFactory import StemmerFactory
-from sentence_transformers import SentenceTransformer, util
-from fuzzywuzzy import fuzz
+from sentence_transformers import util
+import joblib # To load the trained Naive Bayes model
 
-# Set page configuration
+# Import core logic functions from the new utils.py file
+from utils import (
+    load_models_base,
+    load_and_process_data_base,
+    set_global_models,
+    set_global_nb_pipeline, # Import the new setter function
+    normalize_text,
+    extract_entities,
+    extract_political_parties,
+    is_meaning_paraphrase,
+    is_suspicious_change,
+    summarize_text_simple,
+    SYNONYM_DICT,
+    compare_entities,
+    NB_MODEL_PIPELINE # Directly import the global variable for read access in functions
+)
+
+# Streamlit page configuration (unchanged)
 st.set_page_config(
     page_title="Deteksi Berita Hoax",
     page_icon="🔍",
@@ -19,7 +31,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Custom CSS to make the app more attractive
+# Custom CSS (unchanged)
 st.markdown("""
 <style>
     .main-header {
@@ -76,7 +88,7 @@ st.markdown("""
         margin: 10px 0 20px 0;
         text-align: center;
         font-size: 1.5rem;
-        box-shadow: 0 4px 8px rgba(0,0,0,0.1);
+        box_shadow: 0 4px 8px rgba(0,0,0,0.1);
     }
     .detail-card {
         background-color: #f8f9fa;
@@ -115,354 +127,152 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# Load model BERT dan spaCy NER
+
+# Load models and data
 @st.cache_resource
-def load_models():
-    bert_model = SentenceTransformer("indobenchmark/indobert-base-p1")
-    nlp = spacy.load("xx_ent_wiki_sm")  
-    return bert_model, nlp
-
-# Call load_models() once and assign to global variables
-bert_model, nlp = load_models()
-
-# Custom political parties list for Indonesian context
-POLITICAL_PARTIES = {
-    "pkb", "partai kebangkitan bangsa",
-    "gerindra", "partai gerindra",
-    "golkar", "partai golkar",
-    "pdip", "pdi-p", "partai demokrasi indonesia perjuangan",
-    "demokrat", "partai demokrat",
-    "pan", "partai amanat nasional",
-    "pks", "partai keadilan sejahtera",
-    "nasdem", "partai nasdem",
-    "ppp", "partai persatuan pembangunan",
-    "hanura", "partai hati nurani rakyat",
-    "psi", "partai solidaritas indonesia",
-    "perindo", "partai persatuan indonesia",
-    "pkpi", "partai keadilan dan persatuan indonesia",
-    "berkarya", "partai berkarya"
-}
-
-# Enhanced synonym dictionary for better paraphrase handling
-@st.cache_data
-def build_enhanced_synonym_dict():
-    """Build comprehensive synonym dictionary for Indonesian paraphrases"""
-    base_synonyms = {
-        "bakal": "akan", "bakalan": "akan", "hendak": "akan", "mau": "akan", 
-        "akan": "akan", "mesti": "harus", "kudu": "harus", "wajib": "harus",
-        "bilang": "kata", "ucap": "kata", "sebut": "kata", "tutur": "kata",
-        "omong": "kata", "cerita": "kata", "ungkap": "kata", "sampaikan": "kata",
-        "gak": "tidak", "ga": "tidak", "nggak": "tidak", "enggak": "tidak", 
-        "tak": "tidak", "ndak": "tidak", "nda": "tidak", "bukan": "tidak",
-        "lagi": "sedang", "udah": "sudah", "udahan": "sudah", "dah": "sudah", 
-        "telah": "sudah", "pernah": "sudah", "sempat": "sudah",
-        "esok": "besok", "kemarin": "kemarin", "tadi": "kemarin", "tempo": "lalu",
-        "tapi": "tetapi", "namun": "tetapi", "akan tetapi": "tetapi", "cuma": "tetapi",
-        "kecuali": "tetapi", "selain": "kecuali", "dan": "dan", "serta": "dan",
-        "gimana": "bagaimana", "kenapa": "mengapa", "dimana": "di mana",
-        "kayak": "seperti", "kaya": "seperti", "kayaknya": "sepertinya",
-        "macam": "seperti", "mirip": "seperti", "ibarat": "seperti",
-        "banget": "sangat", "sekali": "sangat", "amat": "sangat", "bener": "sangat",
-        "parah": "sangat", "ekstrem": "sangat", "luar biasa": "sangat",
-        "sama": "dengan", "ama": "dengan", "ma": "dengan", "bareng": "dengan",
-        "bersama": "dengan", "beserta": "dengan",
-        "pemda": "pemerintah daerah", "pemkot": "pemerintah kota", 
-        "pemkab": "pemerintah kabupaten", "presiden": "presiden",
-        "menteri": "menteri", "gubernur": "gubernur", "bupati": "bupati",
-        "walikota": "walikota", "camat": "camat", "lurah": "lurah",
-        "satu": "1", "dua": "2", "tiga": "3", "empat": "4", "lima": "5",
-        "enam": "6", "tujuh": "7", "delapan": "8", "sembilan": "9", "sepuluh": "10",
-        "puluhan": "banyak", "ratusan": "banyak", "ribuan": "banyak",
-        "kabar": "berita", "info": "informasi", "laporan": "berita", "warta": "berita",
-        "news": "berita", "breaking": "terbaru", "update": "terbaru", "terkini": "terbaru",
-        "datang": "tiba", "pergi": "berangkat", "pulang": "kembali", "balik": "kembali",
-        "cabut": "pergi", "nongol": "datang", "muncul": "datang", "hadir": "datang",
-        "bagus": "baik", "jelek": "buruk", "gede": "besar", "kecil": "kecil",
-        "mantap": "baik", "keren": "baik", "buruk": "buruk", "parah": "buruk",
-        "oke": "baik", "ok": "baik", "fine": "baik",
-        "doi": "dia", "nyokap": "ibu", "bokap": "ayah", "ortu": "orang tua",
-        "gue": "saya", "gw": "saya", "ane": "saya", "lu": "kamu", "lo": "kamu",
-        "ente": "kamu", "bro": "saudara", "sis": "saudara",
-        "ngaku": "mengaku", "ngomong": "bicara", "ngasih": "memberi",
-        "ngambil": "mengambil", "ngeliat": "melihat", "ngedenger": "mendengar",
-        "nggih": "ya", "injih": "ya", "iya": "ya", "yoi": "ya", "yup": "ya",
-        "enggeh": "ya", "oke": "ya", "siap": "ya",
-        "gadget": "perangkat", "smartphone": "ponsel", "laptop": "komputer",
-        "online": "daring", "offline": "luring", "update": "pembaruan",
-        "duit": "uang", "perak": "uang", "cuan": "keuntungan", "untung": "keuntungan",
-        "rugi": "kerugian", "bangkrut": "pailit", "sukses": "berhasil"
-    }
-    return base_synonyms
-
-@st.cache_data 
-def auto_generate_synonyms(_df):
-    """Automatically detect synonym patterns from dataset with enhanced coverage"""
+def get_cached_models():
+    bert_model, nlp = load_models_base()
+    # Try loading Naive Bayes pipeline, if it doesn't exist, it will be trained by load_and_process_data_base
+    nb_pipeline = None
     try:
-        auto_synonyms = build_enhanced_synonym_dict().copy()
-        all_words = []
-        word_pairs = []
-        
-        for title in _df['title'].dropna():
-            words = str(title).lower().split()
-            clean_words = [re.sub(r'[^\w]', '', w) for w in words if len(w) > 2]
-            all_words.extend(clean_words)
-            
-            for i, word in enumerate(clean_words):
-                for j, other_word in enumerate(clean_words):
-                    if i != j and abs(i-j) <= 3:
-                        word_pairs.append((word, other_word))
-        
-        # word_freq = pd.Series(all_words).value_counts()
-        
-        dataset_patterns = {
-            "dikabarkan": "diberitakan", "dilaporkan": "diberitakan",
-            "diklaim": "dinyatakan", "diungkap": "dikatakan",
-            "terungkap": "diketahui", "terbongkar": "diketahui",
-            "mencuat": "muncul", "merebak": "menyebar",
-            "viral": "terkenal", "heboh": "ramai", "gaduh": "ramai",
-            "kontroversi": "perdebatan", "polemik": "perdebatan",
-            "somasi": "teguran", "gugatan": "tuntutan",
-            "reshuffle": "perombakan", "rotasi": "pergantian",
-            "moratorium": "penghentian", "embargo": "larangan"
-        }
-        auto_synonyms.update(dataset_patterns)
-        
-        abbreviation_patterns = {
-            "yg": "yang", "dg": "dengan", "krn": "karena", "utk": "untuk",
-            "tdk": "tidak", "hrs": "harus", "sdh": "sudah", "blm": "belum",
-            "dr": "dari", "ke": "ke", "pd": "pada", "ttg": "tentang",
-            "spy": "supaya", "krg": "kurang", "lbh": "lebih"
-        }
-        auto_synonyms.update(abbreviation_patterns)
-        
-        return auto_synonyms
-        
-    except Exception as e:
-        st.warning(f"Error generating auto synonyms: {e}")
-        return build_enhanced_synonym_dict()
+        nb_pipeline = joblib.load('naive_bayes_pipeline.pkl')
+        st.success("Loaded Naive Bayes pipeline from file.")
+    except FileNotFoundError:
+        st.warning("Naive Bayes pipeline not found. It will be trained upon data loading (first run might be slower).")
+    return bert_model, nlp, nb_pipeline
 
-# Dictionary sinonim yang akan digunakan
-SYNONYM_DICT = {}
+bert_model, nlp, loaded_nb_pipeline = get_cached_models() # Get the loaded pipeline
+set_global_models(bert_model, nlp)
+# Set the global NB pipeline in utils.py. This is important to ensure utils.py functions can access it.
+set_global_nb_pipeline(loaded_nb_pipeline) 
 
-def normalize_synonyms(text):
-    if not text or pd.isna(text):
-        return ""
-    text = str(text).lower()
-    words = text.split()
-    normalized_words = []
-    i = 0
-    while i < len(words):
-        word = words[i]
-        if i < len(words) - 1:
-            two_word = f"{word} {words[i+1]}"
-            if two_word in SYNONYM_DICT:
-                normalized_words.append(SYNONYM_DICT[two_word])
-                i += 2
-                continue
-        if word in SYNONYM_DICT:
-            normalized_words.append(SYNONYM_DICT[word])
-        else:
-            normalized_words.append(word)
-        i += 1
-    return ' '.join(normalized_words)
-
-def is_meaning_paraphrase(text1, text2, similarity_threshold=0.78):
-    norm1 = normalize_text(text1)
-    norm2 = normalize_text(text2)
-    emb1 = bert_model.encode(norm1, convert_to_tensor=True)
-    emb2 = bert_model.encode(norm2, convert_to_tensor=True)
-    semantic_sim = util.pytorch_cos_sim(emb1, emb2).item()
-    matcher = SequenceMatcher(None, norm1.split(), norm2.split())
-    structural_sim = matcher.ratio()
-    combined_score = 0.8 * semantic_sim + 0.2 * structural_sim
-    return combined_score >= similarity_threshold
-
-def enhanced_entity_matching(entities1, entities2, threshold=75):
-    if not entities1 or not entities2:
-        return False
-    for ent1 in entities1:
-        for ent2 in entities2:
-            if fuzz.token_set_ratio(ent1, ent2) >= threshold:
-                return True
-    return False
-
-def normalize_text(text):
-    if not text or pd.isna(text):
-        return ""
-    stop_factory = StopWordRemoverFactory()
-    stop_words = set(stop_factory.get_stop_words())
-    stop_words.discard('akan')
-    stemmer = StemmerFactory().create_stemmer()
-    text = str(text).lower()
-    text = re.sub(r'[^\w\s]', ' ', text)
-    text = re.sub(r'\s+', ' ', text)
-    text = normalize_synonyms(text)
-    tokens = text.split()
-    tokens = [w for w in tokens if w not in stop_words and len(w) > 1]
-    tokens = [stemmer.stem(w) for w in tokens if len(w) > 3]
-    return ' '.join(tokens)
-
-def extract_entities(text):
-    doc = nlp(text)
-    entities = set(ent.text.lower() for ent in doc.ents if ent.label_ in ['PERSON', 'ORG', 'GPE'])
-    text_lower = text.lower()
-    for party in POLITICAL_PARTIES:
-        if party in text_lower.split():
-            entities.add(party)
-    return entities
-
-def extract_political_parties(text):
-    found_parties = set()
-    text_lower = text.lower()
-    temp_words = text_lower.split()
-    normalized_temp_words = []
-    for word in temp_words:
-        normalized_temp_words.append(SYNONYM_DICT.get(word, word)) 
-    processed_text = " ".join(normalized_temp_words)
-    for party_name_or_alias in POLITICAL_PARTIES:
-        if party_name_or_alias in processed_text:
-            found_parties.add(party_name_or_alias)
-    canonical_parties = set()
-    for found_party in found_parties:
-        if found_party in SYNONYM_DICT and SYNONYM_DICT[found_party] in POLITICAL_PARTIES:
-            canonical_parties.add(SYNONYM_DICT[found_party])
-        elif found_party in POLITICAL_PARTIES:
-            canonical_parties.add(found_party)
-    return canonical_parties
-
-# --- NEW FUNCTION FOR SIMPLE SUMMARIZATION ---
-def summarize_text_simple(text, num_sentences=2):
-    """
-    Summarizes a text by taking the first 'num_sentences' sentences.
-    Assumes sentences are separated by periods.
-    """
-    if not text or pd.isna(text):
-        return "Tidak ada rangkuman."
-    
-    sentences = re.split(r'(?<=[.!?])\s+', text)
-    
-    # Filter out empty strings that might result from split
-    sentences = [s.strip() for s in sentences if s.strip()]
-
-    if not sentences:
-        return "Tidak ada rangkuman."
-
-    # Join the first 'num_sentences' sentences
-    summary = " ".join(sentences[:num_sentences])
-    
-    # Ensure it ends with a period if it doesn't already
-    if summary and summary[-1] not in ['.', '!', '?']:
-        summary += "."
-        
-    return summary
-
-
-# Load dan proses dataset
 @st.cache_data
-def load_data():
-    global SYNONYM_DICT
-    with st.spinner('Memuat dataset...'):
-        df = pd.read_excel("dataset_cnn_summarized - Copy.xlsx")
-        
-        SYNONYM_DICT = auto_generate_synonyms(df)
-        st.sidebar.markdown(f"**Loaded {len(SYNONYM_DICT)} synonym mappings**")
-        
-        df['text_norm'] = df['title'].apply(normalize_text)
-        df['entities'] = df['title'].apply(lambda x: extract_entities(str(x)))
-        df['political_parties'] = df['title'].apply(extract_political_parties)
-        bert_embeddings = bert_model.encode(df['text_norm'].tolist(), convert_to_tensor=True)
-        return df, bert_embeddings
+def get_cached_data():
+    # This function call will trigger the training of the NB model if it wasn't loaded from file
+    df, synonym_dict_generated = load_and_process_data_base() 
+    SYNONYM_DICT.update(synonym_dict_generated)
+    return df
 
-# Assign loaded data and embeddings to global variables
-df, bert_embeddings = load_data()
+df = get_cached_data()
 
-def process_batch_news(news_list, threshold_valid=0.7):
+
+@st.cache_data(show_spinner="Generating embeddings...")
+def get_bert_embeddings(dataframe):
+    if 'text_norm' not in dataframe.columns:
+        dataframe['text_norm'] = dataframe['title'].apply(normalize_text)
+    return bert_model.encode(dataframe['text_norm'].tolist(), convert_to_tensor=True)
+
+bert_embeddings = get_bert_embeddings(df)
+
+st.sidebar.markdown(f"**Loaded {len(SYNONYM_DICT)} synonym mappings**")
+
+
+def process_batch_news(news_list, threshold_valid=0.7, nb_hoax_prob_threshold=0.5):
+    # Declare NB_MODEL_PIPELINE as global if you intent to use it directly like this
+    # global NB_MODEL_PIPELINE # Not strictly needed if only reading, but can prevent NameError if scope is ambiguous.
+
     results = []
     progress_bar = st.progress(0)
     status_text = st.empty()
-    
+
     for i, judul in enumerate(news_list):
         if judul.strip():
             progress = (i + 1) / len(news_list)
             progress_bar.progress(progress)
             status_text.text(f'Processing {i+1}/{len(news_list)}: {judul[:50]}...')
-            
+
             judul_norm = normalize_text(judul)
             input_entities = extract_entities(judul)
             input_parties = extract_political_parties(judul)
             input_vec = bert_model.encode(judul_norm, convert_to_tensor=True)
-            
+
             similarity = util.pytorch_cos_sim(input_vec, bert_embeddings)[0].cpu().numpy()
             idx_max = np.argmax(similarity)
             max_score = similarity[idx_max]
             berita_mirip = df.iloc[idx_max]
-            
+
             entities_mirip = berita_mirip['entities']
             parties_mirip = berita_mirip.get('political_parties', set())
-            
-            party_mismatch = input_parties != parties_mirip and (input_parties or parties_mirip)
+
+            party_mismatch = False
+            # Check for party mismatch more robustly
+            if input_parties and parties_mirip:
+                if not input_parties.issubset(parties_mirip) and not parties_mirip.issubset(input_parties):
+                    party_mismatch = True
+            elif input_parties and not parties_mirip: # If input has parties but matched does not, and similarity is high, might be an issue
+                party_mismatch = True
+
             suspicious, prop_diff = is_suspicious_change(judul, berita_mirip['title'])
             
-            if (max_score >= threshold_valid and 
-                input_entities == entities_mirip and 
-                not party_mismatch):
-                if suspicious:
-                    result = "HOAX"
-                    confidence = f"Suspicious paraphrase ({prop_diff*100:.1f}% diff)"
-                else:
-                    result = "VALID"
-                    confidence = "HIGH" if max_score > 0.85 else "MEDIUM"
-            else:
-                result = "HOAX"
-                reasons = []
-                if max_score < threshold_valid:
-                    reasons.append("Low similarity")
-                if input_entities != entities_mirip or party_mismatch:
-                    reasons.append("Entity mismatch")
-                confidence = f"Reason: {', '.join(reasons)}"
+            entity_match_result = compare_entities(input_entities, entities_mirip)
+
+            # Naive Bayes Prediction
+            nb_prediction_hoax = False
+            nb_hoax_prob = 0.0
+            # Access the global NB_MODEL_PIPELINE from utils
+            if NB_MODEL_PIPELINE: # Check if the pipeline was loaded/trained successfully
+                nb_hoax_prob = NB_MODEL_PIPELINE.predict_proba([judul_norm])[0][1] # Probability of class 1 (hoax)
+                if nb_hoax_prob >= nb_hoax_prob_threshold:
+                    nb_prediction_hoax = True
+
+            # Consolidated Logic for result
+            result = "HOAX" # Default to hoax
+            confidence = "UNKNOWN"
+            reasons = []
+
+            # Determine specific reasons for HOAX classification
+            if not (max_score >= threshold_valid or is_meaning_paraphrase(judul, berita_mirip['title'])):
+                reasons.append(f"similarity rendah ({max_score:.2f})")
+            if not entity_match_result:
+                reasons.append("entitas berbeda")
+            if party_mismatch:
+                reasons.append("perbedaan partai politik")
+            if suspicious:
+                reasons.append(f"modifikasi struktur mencurigakan ({prop_diff*100:.1f}% diff)")
+            if nb_prediction_hoax:
+                reasons.append(f"Sistem mengindikasikan hoaks (prob: {nb_hoax_prob:.2f})")
             
-            # Apply simple summarization to the 'summarized' column content
+            # Refine reasons if it's a paraphrase but still hoax due to entity/party mismatch
+            if is_meaning_paraphrase(judul, berita_mirip['title']) and (not entity_match_result or party_mismatch):
+                if "entitas berbeda" in reasons and "paraphrase namun entitas/partai berbeda" not in reasons:
+                    reasons.remove("entitas berbeda")
+                if "perbedaan partai politik" in reasons and "paraphrase namun entitas/partai berbeda" not in reasons:
+                    reasons.remove("perbedaan partai politik")
+                if "paraphrase namun entitas/partai berbeda" not in reasons:
+                    reasons.append("paraphrase namun entitas/partai berbeda")
+
+            # Final Decision
+            if not reasons: # If no reasons found, it means it's VALID
+                result = "VALID"
+                confidence = "HIGH" if max_score > 0.85 else "MEDIUM"
+            else:
+                confidence = f"Reason: {', '.join(sorted(list(set(reasons))))}" # Sort and unique reasons for clean display
+
+
             short_summary = summarize_text_simple(berita_mirip.get('summarized', 'Tidak ada rangkuman'))
 
             results.append({
                 'Input': judul,
                 'Result': result,
                 'Similarity': max_score,
+                'NB_Hoax_Prob': nb_hoax_prob,
                 'Confidence/Reason': confidence,
                 'Matched_Title': berita_mirip['title'],
-                'Matched_URL': berita_mirip.get('url', 'N/A'),
-                'Matched_Summary_ReRangkum': short_summary # Use the re-summarized text
+                'Matched_URL': f"[Klik untuk baca berita]({berita_mirip.get('url', 'N/A')})",
+                'Matched_Summary_ReRangkum': short_summary
             })
-    
+
     progress_bar.empty()
     status_text.empty()
-    
     return pd.DataFrame(results)
 
-def is_suspicious_change(input_text, matched_text):
-    input_processed_for_diff = normalize_text(input_text)
-    matched_processed_for_diff = normalize_text(matched_text)
-    input_words = input_processed_for_diff.split()
-    matched_words = matched_processed_for_diff.split()
-    matcher = SequenceMatcher(None, input_words, matched_words)
-    ratio = matcher.ratio()
-    num_diff = sum(1 for tag in matcher.get_opcodes() if tag != 'equal')
-    total = max(len(input_words), len(matched_words))
-    prop_diff = num_diff / total if total > 0 else 0
-    if ratio >= 0.98:
-        return False, prop_diff
-    if prop_diff < 0.1:
-        return False, prop_diff
-    if ratio < 0.80 and prop_diff > 0.25:
-        return True, prop_diff
-    return False, prop_diff
-
+# Plotting functions (unchanged)
 def plot_similarity_chart(similarities, df, top_n=5):
     top_indices = np.argsort(similarities)[-top_n:][::-1]
     top_scores = similarities[top_indices]
     top_titles = [df.iloc[i]['title'][:50] + '...' for i in top_indices]
     fig = px.bar(
-        x=top_scores, 
+        x=top_scores,
         y=top_titles,
         orientation='h',
         labels={'x': 'Similarity Score', 'y': 'News Title'},
@@ -550,7 +360,10 @@ def create_gauge_chart(similarity_score):
     )
     return fig
 
-def prediksi_berita(judul_berita, threshold_valid=0.7, threshold_rekom=0.35):
+def prediksi_berita(judul_berita, threshold_valid=0.7, threshold_rekom=0.35, nb_hoax_prob_threshold=0.5):
+    # Declare NB_MODEL_PIPELINE as global to access it
+    # global NB_MODEL_PIPELINE # Not strictly needed if only reading, but good practice.
+    
     judul_norm = normalize_text(judul_berita)
     input_entities = extract_entities(judul_berita)
     input_parties = extract_political_parties(judul_berita)
@@ -565,77 +378,88 @@ def prediksi_berita(judul_berita, threshold_valid=0.7, threshold_rekom=0.35):
     parties_mirip = berita_mirip.get('political_parties', set())
 
     party_mismatch = False
-    if input_parties != parties_mirip and (input_parties or parties_mirip):
+    if input_parties and parties_mirip:
+        if not input_parties.issubset(parties_mirip) and not parties_mirip.issubset(input_parties):
+            party_mismatch = True
+    elif input_parties and not parties_mirip:
         party_mismatch = True
 
     suspicious, prop_diff = is_suspicious_change(judul_berita, berita_mirip['title'])
 
     is_para = is_meaning_paraphrase(judul_berita, berita_mirip['title'])
-    entity_match = (input_entities == entities_mirip)
+    
+    entity_match_result = compare_entities(input_entities, entities_mirip)
 
-    if (max_score >= threshold_valid or is_para) and entity_match and not party_mismatch:
-        if suspicious:
-            st.markdown(f'<div class="hoax-result">', unsafe_allow_html=True)
-            st.markdown(f'<div class="big-result-icon">⚠️</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="result-title">HOAX</div>', unsafe_allow_html=True)
-            st.markdown(f"<p>Modifikasi struktur mencurigakan ({prop_diff*100:.1f}% kata berbeda)</p>", unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="valid-result">', unsafe_allow_html=True)
-            st.markdown(f'<div class="big-result-icon">✅</div>', unsafe_allow_html=True)
-            st.markdown(f'<div class="result-title">VALID, Berita ini terverifikasi dan terpercaya</div>', unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+    # Naive Bayes Prediction for single input
+    nb_prediction_hoax = False
+    nb_hoax_prob = 0.0
+    if NB_MODEL_PIPELINE: # Access the global NB_MODEL_PIPELINE from utils
+        nb_hoax_prob = NB_MODEL_PIPELINE.predict_proba([judul_norm])[0][1] # Probability of class 1 (hoax)
+        if nb_hoax_prob >= nb_hoax_prob_threshold:
+            nb_prediction_hoax = True
+        st.markdown(f"**Naive Bayes Hoax Probability:** `{nb_hoax_prob:.4f}`")
+    else:
+        st.warning("Naive Bayes model not loaded. Prediction will proceed without it.")
+
+
+    # Consolidated Logic for result
+    result_class = "HOAX" # Default to hoax
+    reasons = []
+
+    # Determine specific reasons for HOAX classification
+    if not (max_score >= threshold_valid or is_para):
+        reasons.append(f"similarity rendah ({max_score:.2f})")
+        if is_para: # If it's a paraphrase but similarity is low, it means is_para is not enough
+            reasons.append("paraphrase tapi similarity sangat rendah")
+    if not entity_match_result:
+        reasons.append("entitas berbeda")
+    if party_mismatch:
+        reasons.append("perbedaan partai politik")
+    if suspicious:
+        reasons.append(f"modifikasi struktur mencurigakan ({prop_diff*100:.1f}% diff)")
+    if nb_prediction_hoax:
+        reasons.append(f"Naive Bayes mengindikasikan hoaks (prob: {nb_hoax_prob:.2f})")
+
+    # Refine the 'paraphrase but different entities/parties' reason
+    if is_para and (not entity_match_result or party_mismatch):
+        # Remove general entity/party mismatch if more specific paraphrase reason applies
+        reasons = [r for r in reasons if "entitas berbeda" not in r and "perbedaan partai politik" not in r]
+        if "paraphrase namun entitas/partai berbeda" not in reasons: # Avoid adding duplicate
+            reasons.append("paraphrase namun entitas/partai berbeda")
+
+    if not reasons: # If no specific reason found, it means it's VALID
+        result_class = "VALID"
+
+
+    if result_class == "VALID":
+        st.markdown(f'<div class="valid-result">', unsafe_allow_html=True)
+        st.markdown(f'<div class="big-result-icon">✅</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="result-title">VALID, Berita ini terverifikasi dan terpercaya</div>', unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
     else:
         st.markdown(f'<div class="hoax-result">', unsafe_allow_html=True)
         st.markdown(f'<div class="big-result-icon">❌</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="result-title">HOAX</div>', unsafe_allow_html=True)
-        reasons = []
-        if max_score < threshold_valid and not is_para:
-            reasons.append("similarity rendah")
-        elif max_score >= threshold_valid and not entity_match:
-            reasons.append("entitas berbeda")
-        elif max_score >= threshold_valid and party_mismatch:
-            reasons.append("perbedaan partai politik")
-        elif is_para and not entity_match:
-            reasons.append("paraphrase namun entitas berbeda")
-        elif is_para and party_mismatch:
-            reasons.append("paraphrase namun perbedaan partai politik")
-        
-        if not reasons:
-            reasons.append("tidak cocok dengan pola berita valid")
-
-        st.markdown(f"<p>Berita tidak terverifikasi ({' dan '.join(reasons)})</p>", unsafe_allow_html=True)
+        st.markdown(f"<p>Berita tidak terverifikasi ({' dan '.join(sorted(list(set(reasons))))})</p>", unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
     st.plotly_chart(
         plot_similarity_chart(similarity, df),
         use_container_width=True
     )
-    st.markdown('</div>', unsafe_allow_html=True)
 
-    if (max_score >= threshold_valid and
-        input_entities == entities_mirip and
-        not party_mismatch):
-        # Apply simple summarization to the 'summarized' column content
+    # Display details based on whether it was a VALID match or a suspicious paraphrase HOAX
+    if (result_class == "VALID" or (result_class == "HOAX" and "modifikasi struktur mencurigakan" in " ".join(reasons))):
         short_summary_matched = summarize_text_simple(berita_mirip.get('summarized', 'Tidak ada rangkuman'))
 
-        if suspicious:
-            st.markdown('<div class="detail-card">', unsafe_allow_html=True)
-            st.markdown("<h3>🔍 Informasi Detail</h3>", unsafe_allow_html=True)
-            st.markdown("<p>Berita ini sangat mirip dengan berita asli namun memiliki perubahan kecil yang mencurigakan:</p>", unsafe_allow_html=True)
-            st.markdown(f"<p><b>Judul Asli (dari dataset)</b>: {berita_mirip['title']}</p>", unsafe_allow_html=True)
-            st.markdown(f"<p><b>Rangkuman Isi Berita Serupa</b>: {short_summary_matched}</p>", unsafe_allow_html=True) # Use the re-summarized text
-            st.markdown(f"<p>🌐 <b>Link</b>: {berita_mirip.get('url', 'Tidak ada URL')}</p>", unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
-        else:
-            st.markdown('<div class="detail-card">', unsafe_allow_html=True)
-            st.markdown("<h3>🔍 Informasi Detail</h3>", unsafe_allow_html=True)
-            st.markdown(f"<p><b>Judul Berita Serupa</b>: {berita_mirip['title']}</p>", unsafe_allow_html=True)
-            st.markdown(f"<p><b>Rangkuman Isi Berita Serupa</b>: {short_summary_matched}</p>", unsafe_allow_html=True) # Use the re-summarized text
-            st.markdown(f"<p>🌐 <b>Link</b>: {berita_mirip.get('url', 'Tidak ada URL')}</p>", unsafe_allow_html=True)
-            st.markdown('</div>', unsafe_allow_html=True)
+        st.markdown('<div class="detail-card">', unsafe_allow_html=True)
+        st.markdown("<h3>🔍 Informasi Detail</h3>", unsafe_allow_html=True)
+        st.markdown(f"<p><b>Judul Berita Serupa</b>: {berita_mirip['title']}</p>", unsafe_allow_html=True)
+        st.markdown(f"<p><b>Rangkuman Berita</b>: {short_summary_matched}</p>", unsafe_allow_html=True)
+        st.markdown(f"<p>🌐 <b>Link</b>: {berita_mirip.get('url', 'Tidak ada URL')}</p>", unsafe_allow_html=True)
+        st.markdown('</div>', unsafe_allow_html=True)
 
-    else:
+    else: # If classified as HOAX for other reasons (e.g., low similarity, entity mismatch, NB hoax)
         df_valid = df[df['label'] == 0].copy()
         if not df_valid.empty:
             valid_embeddings = bert_model.encode(df_valid['text_norm'].tolist(), convert_to_tensor=True)
@@ -645,14 +469,13 @@ def prediksi_berita(judul_berita, threshold_valid=0.7, threshold_rekom=0.35):
             if max_sim_rekom >= threshold_rekom:
                 idx_valid = np.argmax(sim_valid)
                 rekom = df_valid.iloc[idx_valid]
-                
-                # Apply simple summarization to the 'summarized' column content for recommendation
+
                 short_summary_rekom = summarize_text_simple(rekom.get('summarized', 'Tidak ada rangkuman'))
 
                 st.markdown('<div class="detail-card">', unsafe_allow_html=True)
                 st.markdown("<h3>🔁 Rekomendasi Berita Valid:</h3>", unsafe_allow_html=True)
                 st.markdown(f"<p><b>Judul</b>: {rekom['title']}</p>", unsafe_allow_html=True)
-                st.markdown(f"<p><b>Rangkuman Isi Berita Rekomendasi</b>: {short_summary_rekom}</p>", unsafe_allow_html=True) # Use the re-summarized text
+                st.markdown(f"<p><b>Rangkuman Isi Berita Rekomendasi</b>: {short_summary_rekom}</p>", unsafe_allow_html=True)
                 st.markdown(f"<p><b>URL</b>: {rekom.get('url', 'Tidak ada URL')}</p>", unsafe_allow_html=True)
                 st.markdown(f"<p><b>Similarity</b>: {max_sim_rekom:.4f}</p>", unsafe_allow_html=True)
                 st.markdown('</div>', unsafe_allow_html=True)
@@ -664,8 +487,8 @@ def prediksi_berita(judul_berita, threshold_valid=0.7, threshold_rekom=0.35):
             st.markdown('<div class="warning-result">', unsafe_allow_html=True)
             st.markdown("⚠️ Tidak ada berita valid dalam dataset.", unsafe_allow_html=True)
             st.markdown('</div>', unsafe_allow_html=True)
-            
-# Sidebar content
+
+# Sidebar and Main content UI remains unchanged.
 st.sidebar.image("https://img.icons8.com/color/96/000000/news.png", width=100)
 st.sidebar.markdown("<h2>Tentang Aplikasi</h2>", unsafe_allow_html=True)
 st.sidebar.markdown("""
@@ -681,11 +504,9 @@ st.sidebar.markdown("""
 Kami menggunakan kumpulan berita dari media terpercaya dan kecerdasan buatan untuk memberikan hasil terbaik.
 """)
 
-# Main content
 st.markdown('<h1 class="main-header">🕵️‍♂️ TrueLens</h1>', unsafe_allow_html=True)
 st.markdown('<p style="text-align: center; font-size: 1.2rem; margin-bottom: 2rem;">Smarter News. Safer Minds</p>', unsafe_allow_html=True)
 
-# Create tabs for different input methods
 tab1, tab2, tab3 = st.tabs(["📝 Input Manual", "📄 Upload File", "⚡ Batch Processing"])
 
 with tab1:
@@ -708,40 +529,40 @@ with tab1:
 with tab2:
     st.markdown("### Upload File CSV/Excel")
     st.markdown("**Format file:** File harus memiliki kolom 'title' dan opsional 'summarized' yang berisi judul berita dan ringkasan")
-    
+
     uploaded_file = st.file_uploader(
-        "Pilih file CSV atau Excel",  
+        "Pilih file CSV atau Excel",
         type=['csv', 'xlsx', 'xls'],
         help="File harus memiliki kolom 'title' dan opsional 'summarized' yang berisi judul berita"
     )
-    
+
     if uploaded_file is not None:
         try:
             if uploaded_file.name.endswith('.csv'):
                 upload_df = pd.read_csv(uploaded_file)
             else:
                 upload_df = pd.read_excel(uploaded_file)
-            
+
             st.success(f"File berhasil diupload! Ditemukan {len(upload_df)} baris data.")
-            
+
             if 'title' in upload_df.columns:
                 st.markdown("**Preview data:**")
                 st.dataframe(upload_df.head(), use_container_width=True)
-                
+
                 col1, col2, col3 = st.columns([2, 1, 2])
                 with col2:
                     process_upload = st.button("🚀 PROSES SEMUA", use_container_width=True, key="process_upload")
-                
+
                 if process_upload:
                     st.markdown('<h2 class="sub-header">📊 Hasil Batch Processing</h2>', unsafe_allow_html=True)
                     news_titles = upload_df['title'].dropna().tolist()
-                    
+
                     if news_titles:
                         with st.spinner('Memproses semua berita...'):
                             results_df = process_batch_news(news_titles)
-                        
+
                         st.success(f"Selesai memproses {len(results_df)} berita!")
-                        
+
                         col1, col2, col3, col4 = st.columns(4)
                         with col1:
                             valid_count = len(results_df[results_df['Result'] == 'VALID'])
@@ -753,13 +574,13 @@ with tab2:
                             avg_similarity = results_df['Similarity'].mean()
                             st.metric("Avg Similarity", f"{avg_similarity:.3f}")
                         with col4:
-                            high_confidence = len(results_df[results_df['Confidence/Reason'] == 'HIGH'])
-                            st.metric("High Confidence", high_confidence)
-                        
+                            # You might want to add a metric for average NB Hoax Probability here
+                            avg_nb_prob = results_df['NB_Hoax_Prob'].mean()
+                            st.metric("Avg NB Hoax Prob", f"{avg_nb_prob:.3f}")
+
                         st.markdown("**Hasil Detail:**")
-                        # Display the new column with re-summarized text
                         st.dataframe(results_df.rename(columns={'Matched_Summary_ReRangkum': 'Rangkuman Berita Serupa'}), use_container_width=True)
-                        
+
                         csv = results_df.to_csv(index=False)
                         st.download_button(
                             label="📥 Download Hasil CSV",
@@ -773,25 +594,25 @@ with tab2:
                 st.error("File harus memiliki kolom 'title' yang berisi judul berita!")
                 st.markdown("**Kolom yang ditemukan:**")
                 st.write(list(upload_df.columns))
-                
+
         except Exception as e:
             st.error(f"Error membaca file: {str(e)}")
 
 with tab3:
     st.markdown("### Batch Processing - Input Multiple")
     st.markdown("Masukkan beberapa judul berita sekaligus (satu judul per baris)")
-    
+
     batch_input = st.text_area(
         "Masukkan judul-judul berita (pisahkan dengan enter):",
         height=200,
         placeholder="Presiden akan berkunjung ke Jakarta\nMenteri kesehatan bakal resmikan rumah sakit\nDLL...",
         key="batch_input"
     )
-    
+
     col1, col2, col3 = st.columns([2, 1, 2])
     with col2:
         batch_detect = st.button("🚀 PROSES BATCH", use_container_width=True, key="batch_detect")
-    
+
     if batch_detect:
         if batch_input.strip() == "":
             st.markdown('<div class="warning-result">', unsafe_allow_html=True)
@@ -799,16 +620,16 @@ with tab3:
             st.markdown('</div>', unsafe_allow_html=True)
         else:
             news_list = [line.strip() for line in batch_input.split('\n') if line.strip()]
-            
+
             if news_list:
                 st.markdown('<h2 class="sub-header">📊 Hasil Batch Processing</h2>', unsafe_allow_html=True)
                 st.info(f"Memproses {len(news_list)} judul berita...")
-                
+
                 with st.spinner('Memproses semua berita...'):
                     results_df = process_batch_news(news_list)
-                
+
                 st.success(f"Selesai memproses {len(results_df)} berita!")
-                
+
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
                     valid_count = len(results_df[results_df['Result'] == 'VALID'])
@@ -820,13 +641,12 @@ with tab3:
                     avg_similarity = results_df['Similarity'].mean()
                     st.metric("Avg Similarity", f"{avg_similarity:.3f}")
                 with col4:
-                    high_confidence = len(results_df[results_df['Confidence/Reason'] == 'HIGH'])
-                    st.metric("High Confidence", high_confidence)
-                
+                    avg_nb_prob = results_df['NB_Hoax_Prob'].mean()
+                    st.metric("Avg NB Hoax Prob", f"{avg_nb_prob:.3f}")
+
                 st.markdown("**Hasil Detail:**")
-                # Display the new column with re-summarized text
                 st.dataframe(results_df.rename(columns={'Matched_Summary_ReRangkum': 'Rangkuman Berita Serupa'}), use_container_width=True)
-                
+
                 csv = results_df.to_csv(index=False)
                 st.download_button(
                     label="📥 Download Hasil CSV",
